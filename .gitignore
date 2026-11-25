@@ -1,0 +1,37 @@
+# --- গোপন তথ্য (কখনো GitHub-এ যাবে না) ---
+.streamlit/secrets.toml
+secrets.toml
+.env
+.env.*
+*.env
+cookies.txt
+cookies*.txt
+*cookies*.txt
+*.pem
+*.key
+
+# --- তৈরি হওয়া অডিও/অস্থায়ী ফাইল ---
+*.mp3
+*.m4a
+*.opus
+*.flac
+*.wav
+*.webm
+*.part
+*.ytdl
+ytas_*
+job_*
+.ytas_*
+
+# --- Python / এডিটর / সিস্টেম ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+crash_log.txt
