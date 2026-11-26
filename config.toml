@@ -1,0 +1,16 @@
+[theme]
+base = "dark"
+primaryColor = "#7c5cff"
+backgroundColor = "#0e1014"
+secondaryBackgroundColor = "#161920"
+textColor = "#e8ebf3"
+
+[server]
+# ফাইল-ওয়াচার বন্ধ: ফ্রি সার্ভারে CPU/RAM বাঁচায়
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"

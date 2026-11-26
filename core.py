@@ -41,6 +41,12 @@ COVER_SIZES = {
 
 FMT_NORMAL = "bestaudio[ext=m4a]/bestaudio/best"
 FMT_SMALL = "worstaudio[ext=m4a]/worstaudio/bestaudio[ext=m4a]/bestaudio/best"
+# HLS (m3u8): YouTube-এর যেসব ক্লায়েন্টে সাধারণ https লিংকে 403/SABR আসে, সেখানে HLS প্রায়ই PO Token ছাড়াই চলে।
+# অডিও-অনলি HLS থাকলে সেটা, না থাকলে সবচেয়ে ছোট (144p) মিশ্র ফরম্যাট নামিয়ে শুধু অডিও নেওয়া হয়।
+FMT_HLS = "bestaudio[protocol*=m3u8]/best[protocol*=m3u8]"
+HLS_SORT = ["+res", "+size"]
+MIN_YTDLP = (2026, 8, 19)   # এর আগের yt-dlp-তে YouTube 403 (android_vr/SABR) বাগ ছিল
+LAST_GOOD = {}              # সর্বশেষ যে পদ্ধতি কাজ করেছে (পরেরবার সেটা আগে চেষ্টা হবে)
 
 
 class Cancelled(Exception):
@@ -49,6 +55,17 @@ class Cancelled(Exception):
 
 class TooLong(Exception):
     """ভিডিও সীমার চেয়ে লম্বা (ফ্রি সার্ভারের সুরক্ষা)।"""
+
+
+class HttpBlocked(Exception):
+    """ডাউনলোড লিংকে YouTube 403/401/410 দিয়েছে (PO Token / SABR / IP ব্লক)।"""
+
+
+class AllFailed(Exception):
+    """সবগুলো ডাউনলোড পদ্ধতি ব্যর্থ। .attempts = [(পদ্ধতি, কারণ), ...]"""
+    def __init__(self, attempts):
+        self.attempts = attempts
+        super().__init__("সবগুলো ডাউনলোড পদ্ধতি ব্যর্থ: " + "; ".join(f"{n}: {r}" for n, r in attempts))
 
 
 # ---------------------------------------------------------------------
@@ -95,6 +112,26 @@ def cpu_cores():
     return os.cpu_count() or 1
 
 
+def detect_mode():
+    """"local" (নিজের Windows/Mac পিসি) / "cloud" (Streamlit Community Cloud) / "server" (অন্য লিনাক্স সার্ভার)।
+    জোর করে ঠিক করতে পরিবেশ-চলক APP_MODE=local|cloud ব্যবহার করুন।"""
+    forced = os.environ.get("APP_MODE", "").strip().lower()
+    if forced in ("local", "cloud", "server"):
+        return forced
+    if os.path.isdir("/mount/src") or os.environ.get("STREAMLIT_RUNTIME_ENV", "") == "cloud":
+        return "cloud"
+    return "local" if sys.platform.startswith(("win", "darwin")) else "server"
+
+
+def ytdlp_version_ok():
+    """yt-dlp কি MIN_YTDLP (2026.08.19)-এর সমান বা নতুন? ভার্সন না পড়া গেলে None।"""
+    v = ytdlp_version()
+    m = re.match(r"(\d{4})\.(\d{1,2})\.(\d{1,2})", v or "")
+    if not m:
+        return None
+    return tuple(int(x) for x in m.groups()) >= MIN_YTDLP
+
+
 def ytdlp_version():
     try:
         from yt_dlp.version import __version__
@@ -111,17 +148,24 @@ def update_ytdlp():
 
 
 def ensure_deno():
-    """yt-dlp-র YouTube চ্যালেঞ্জের জন্য JavaScript রানটাইম (Deno) লাগে। না থাকলে GitHub থেকে নামিয়ে নেয়।"""
+    """yt-dlp-র YouTube চ্যালেঞ্জের জন্য JavaScript রানটাইম (Deno) লাগে। না থাকলে GitHub থেকে নামিয়ে নেয়।
+    (Linux / Windows / macOS)। সফল হলে deno-র পাথ, না হলে None।"""
     try:
         exe = shutil.which("deno")
         if exe:
             return exe
-        if not sys.platform.startswith("linux"):
-            return None
         arch = platform.machine().lower()
-        target = "aarch64-unknown-linux-gnu" if arch in ("aarch64", "arm64") else "x86_64-unknown-linux-gnu"
+        arm = arch in ("aarch64", "arm64")
+        if sys.platform.startswith("linux"):
+            target, exe_name = ("aarch64-unknown-linux-gnu" if arm else "x86_64-unknown-linux-gnu"), "deno"
+        elif sys.platform == "win32":
+            target, exe_name = ("aarch64-pc-windows-msvc" if arm else "x86_64-pc-windows-msvc"), "deno.exe"
+        elif sys.platform == "darwin":
+            target, exe_name = ("aarch64-apple-darwin" if arm else "x86_64-apple-darwin"), "deno"
+        else:
+            return None
         d = os.path.join(os.path.expanduser("~"), ".cache", "ytas_deno")
-        exe = os.path.join(d, "deno")
+        exe = os.path.join(d, exe_name)
         if not os.path.isfile(exe):
             os.makedirs(d, exist_ok=True)
             url = f"https://github.com/denoland/deno/releases/latest/download/deno-{target}.zip"
@@ -130,9 +174,10 @@ def ensure_deno():
             with urllib.request.urlopen(req, timeout=180) as r, open(zp, "wb") as f:
                 shutil.copyfileobj(r, f)
             with zipfile.ZipFile(zp) as z:
-                z.extract("deno", d)
+                z.extract(exe_name, d)
             os.remove(zp)
-            os.chmod(exe, os.stat(exe).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            if exe_name == "deno":
+                os.chmod(exe, os.stat(exe).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
         ok = subprocess.run([exe, "--version"], capture_output=True, timeout=30).returncode == 0
         return exe if ok else None
@@ -172,30 +217,62 @@ def cleanup_old(base_dir, max_age_sec=2 * 3600):
 # ---------------------------------------------------------------------
 #  yt-dlp অপশন
 # ---------------------------------------------------------------------
-def ydl_base_opts(s, light=True):
+def ydl_base_opts(s, clients=None, use_cookies=True):
+    """yt-dlp-র সাধারণ অপশন। ধ্যান দিন: আগে এখানে HLS/DASH বাদ দেওয়া হতো, যা ২০২৬-এর YouTube-এ ক্ষতিকর
+    (HLS-ই PO Token ছাড়া চলা একমাত্র পথ হতে পারে), তাই এখন কিছুই বাদ দেওয়া হয় না (শুধু অনুবাদ-সাবটাইটেল ছাড়া)।"""
     o = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
         "retries": 8, "fragment_retries": 8, "socket_timeout": 30,
     }
-    ea = {}
-    if light:
-        ea["skip"] = ["hls", "dash", "translated_subs"]   # হালকা ও দ্রুত তথ্য আনা
-    clients = [c.strip() for c in (s.get("clients") or []) if c and c.strip()]
-    if clients:
-        ea["player_client"] = clients
-    if ea:
-        o["extractor_args"] = {"youtube": ea}
-    if s.get("cookies"):
-        o["cookiefile"] = s["cookies"]
+    ea = {"skip": ["translated_subs"]}
+    cl = clients if clients is not None else [c.strip() for c in (s.get("clients") or []) if c and c.strip()]
+    if cl:
+        ea["player_client"] = list(cl)
+    o["extractor_args"] = {"youtube": ea}
+    if use_cookies:
+        if s.get("cookies"):
+            o["cookiefile"] = s["cookies"]
+        elif s.get("browser"):
+            o["cookiesfrombrowser"] = (s["browser"],)   # লোকাল মোড: ব্রাউজারের লগইন সেশন (Firefox সবচেয়ে নির্ভরযোগ্য)
     if s.get("proxy"):
         o["proxy"] = s["proxy"]
+    return o
+
+
+def build_strategies(s):
+    """ডাউনলোড পদ্ধতির তালিকা (একটা ব্যর্থ হলে পরেরটা)। সর্বশেষ কাজ করা পদ্ধতি সবার আগে।
+    kind: "audio" = অডিও-অনলি https স্ট্রিম, "hls" = HLS (PO Token লাগে না এমন পথ)।"""
+    custom = [c.strip() for c in (s.get("clients") or []) if c and c.strip()]
+    st = []
+    if custom:
+        st.append({"name": "custom:" + ",".join(custom), "clients": custom, "kind": "audio", "cookies": True})
+    st += [
+        {"name": "default", "clients": [], "kind": "audio", "cookies": True},
+        {"name": "android", "clients": ["android"], "kind": "audio", "cookies": False},      # এই ক্লায়েন্ট কুকি নেয় না
+        {"name": "tv", "clients": ["tv"], "kind": "audio", "cookies": True},
+        {"name": "web_embedded", "clients": ["web_embedded"], "kind": "audio", "cookies": True},
+        {"name": "hls", "clients": ["web_safari"], "kind": "hls", "cookies": True},
+        {"name": "hls-mweb", "clients": ["mweb"], "kind": "hls", "cookies": True},
+    ]
+    good = LAST_GOOD.get("name")
+    st.sort(key=lambda x: 0 if x["name"] == good else 1)
+    return st
+
+
+def strategy_opts(s, strat):
+    o = ydl_base_opts(s, clients=strat["clients"], use_cookies=strat.get("cookies", True))
+    if strat["kind"] == "hls":
+        o["format"] = FMT_HLS
+        o["format_sort"] = list(HLS_SORT)
+    else:
+        o["format"] = FMT_SMALL if s.get("ultra") else FMT_NORMAL
     return o
 
 
 def get_info(url, s):
     """লিংকের শিরোনাম, সময়, থাম্বনেল ইত্যাদি (ডাউনলোড ছাড়া)।"""
     import yt_dlp
-    opts = ydl_base_opts(s, light=True)
+    opts = ydl_base_opts(s)
     opts.update({"skip_download": True, "extract_flat": "in_playlist"})
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -334,7 +411,7 @@ def id3_size(path):
 # ---------------------------------------------------------------------
 #  সমান্তরাল ডাউনলোড
 # ---------------------------------------------------------------------
-def parallel_range_download(url, headers, part_path, on_progress, cancel, workers=12):
+def parallel_range_download(url, headers, part_path, on_progress, cancel, workers=6):
     """একই ফাইল অনেক সংযোগে টুকরো টুকরো করে একসাথে নামায়। সফল হলে True, না হলে False।"""
     def req(a, b):
         h = dict(headers)
@@ -348,6 +425,10 @@ def parallel_range_download(url, headers, part_path, on_progress, cancel, worker
                 return False
             total = int(cr.split("/")[-1])
             r.read()
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403, 410, 429):
+            raise HttpBlocked(f"HTTP {e.code}")   # ব্লক: এই পদ্ধতি বাদ, পরেরটা চেষ্টা হবে
+        return False
     except Exception:
         return False
     if total < 1024:
@@ -395,6 +476,9 @@ def parallel_range_download(url, headers, part_path, on_progress, cancel, worker
                 except Exception as ex:
                     with lock:
                         done[0] -= got
+                    if isinstance(ex, urllib.error.HTTPError) and ex.code in (401, 403, 410, 429):
+                        err[0] = ex          # ব্লক হলে রিট্রাই করে লাভ নেই
+                        return
                     if attempt == 3:
                         err[0] = ex
                         return
@@ -433,6 +517,8 @@ def parallel_range_download(url, headers, part_path, on_progress, cancel, worker
             os.remove(part_path)
         except OSError:
             pass
+        if isinstance(err[0], urllib.error.HTTPError) and err[0].code in (401, 403, 410, 429):
+            raise HttpBlocked(f"HTTP {err[0].code}")
         return False
     on_progress(1.0, total / max(time.time() - t0, 0.001), 0)
     return True
@@ -444,12 +530,12 @@ def _check_len(info, max_seconds):
         raise TooLong(f"ভিডিওটি {fmt_time(d)} লম্বা; ফ্রি সার্ভারে সর্বোচ্চ {fmt_time(max_seconds)} সমর্থিত।")
 
 
-def fast_fetch(url, s, src_base, on_progress, cancel, want_cover, max_seconds):
-    """দ্রুত পথ: তথ্য আনা + সমান্তরাল ডাউনলোড। সফল হলে (পাথ, info, তথ্য-সময়, ডাউনলোড-সময়), না হলে None।"""
+def fast_fetch(url, s, strat, src_base, on_progress, cancel, want_cover, max_seconds):
+    """দ্রুত পথ: তথ্য আনা + সমান্তরাল ডাউনলোড। সফল হলে (পাথ, info, তথ্য-সময়, ডাউনলোড-সময়),
+    https নয়/সমর্থিত নয় হলে None; লিংকে 403 হলে HttpBlocked।"""
     import yt_dlp
     t0 = time.time()
-    opts = ydl_base_opts(s, light=True)
-    opts["format"] = FMT_SMALL if s.get("ultra") else FMT_NORMAL
+    opts = strategy_opts(s, strat)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if not info or info.get("_type") == "playlist":
@@ -484,7 +570,7 @@ def fast_fetch(url, s, src_base, on_progress, cancel, want_cover, max_seconds):
     return path, info, t_extract, time.time() - t1
 
 
-def download_fallback(url, s, src_base, on_progress, cancel, max_seconds):
+def download_fallback(url, s, strat, src_base, on_progress, cancel, max_seconds):
     """সাধারণ yt-dlp ডাউনলোড (ফলব্যাক)। yt-dlp আলাদা থ্রেডে চলে, অগ্রগতি মূল থ্রেডে দেখানো হয়।"""
     import yt_dlp
     state = {"frac": 0.0, "speed": 0.0, "eta": 0.0}
@@ -503,9 +589,8 @@ def download_fallback(url, s, src_base, on_progress, cancel, max_seconds):
             state["speed"] = d.get("speed") or 0
             state["eta"] = d.get("eta") or 0
 
-    opts = ydl_base_opts(s, light=False)
+    opts = strategy_opts(s, strat)
     opts.update({
-        "format": FMT_SMALL if s.get("ultra") else FMT_NORMAL,
         "outtmpl": src_base + ".%(ext)s",
         "progress_hooks": [hook],
         "concurrent_fragment_downloads": 4,
@@ -860,19 +945,45 @@ def process_url(url, s, workdir, idx, on_update, cancel):
         on_update(frac * dl_share, f"⚡ ডাউনলোড {frac * 100:.0f}%  •  {speed / 1048576:.1f} MB/s  •  বাকি {fmt_time(eta)}")
 
     on_update(0.0, "তথ্য আনা হচ্ছে...")
+    strategies = build_strategies(s)
+    attempts = []
     res = None
+    used = None
+    want_cover = bool(s.get("cover")) and codec in ("mp3", "m4a")
+    for si, strat in enumerate(strategies):
+        if cancel.is_set():
+            raise Cancelled()
+        name = strat["name"]
+        on_update(0.0, f"তথ্য আনা হচ্ছে... (পদ্ধতি {si + 1}/{len(strategies)}: {name})")
+        try:
+            r = None
+            if strat["kind"] != "hls":
+                r = fast_fetch(url, s, strat, src_base, dl_cb, cancel, want_cover, max_seconds)
+            if r is None:
+                r = download_fallback(url, s, strat, src_base, dl_cb, cancel, max_seconds)
+            res, used = r, strat
+            break
+        except (Cancelled, TooLong):
+            raise
+        except HttpBlocked as e:
+            attempts.append((name, f"{e} - ডাউনলোড লিংক ব্লক (PO Token/SABR/IP)"))
+        except Exception as e:   # noqa
+            attempts.append((name, str(e).replace("ERROR: ", "").strip().splitlines()[0][:150] if str(e).strip() else "অজানা ত্রুটি"))
+        finally:
+            if res is None:   # ব্যর্থ পদ্ধতির আংশিক ফাইল মুছে ফেলা
+                for fn in os.listdir(workdir):
+                    if fn.startswith(f"src{idx}"):
+                        try:
+                            os.remove(os.path.join(workdir, fn))
+                        except OSError:
+                            pass
+    if res is None:
+        raise AllFailed(attempts)
+    LAST_GOOD["name"] = used["name"]
+    if attempts:
+        notes.append("ℹ আগের পদ্ধতি ব্যর্থ: " + " | ".join(f"{n}" for n, _ in attempts))
+    notes.append(f"ℹ ডাউনলোড পদ্ধতি: {used['name']}" + (" (HLS থেকে শুধু অডিও নেওয়া হয়েছে)" if used["kind"] == "hls" else ""))
     try:
-        res = fast_fetch(url, s, src_base, dl_cb, cancel, bool(s.get("cover")) and codec in ("mp3", "m4a"), max_seconds)
-        if res is None:
-            notes.append("ℹ সমান্তরাল ডাউনলোড সম্ভব হয়নি, সাধারণ পদ্ধতিতে নামানো হয়েছে।")
-    except (Cancelled, TooLong):
-        raise
-    except Exception as ex:
-        notes.append(f"ℹ দ্রুত ডাউনলোড হয়নি ({str(ex)[:90]}), সাধারণ পদ্ধতিতে চেষ্টা হচ্ছে।")
-        res = None
-    try:
-        if res is None:
-            res = download_fallback(url, s, src_base, dl_cb, cancel, max_seconds)
         src_path, info, t_ext, t_dl = res
 
         def conv_cb(frac):
@@ -908,3 +1019,176 @@ def process_url(url, s, workdir, idx, on_update, cancel):
         "t_extract": t_ext, "t_download": t_dl, "t_convert": t_conv, "t_total": time.time() - t_item,
         "uploader": info.get("uploader") or info.get("channel") or "",
     }
+
+
+# ---------------------------------------------------------------------
+#  ডায়াগনস্টিক: ডাউনলোড কেন ব্যর্থ হচ্ছে তা ধাপে ধাপে পরীক্ষা (কিছু নামায় না)
+# ---------------------------------------------------------------------
+_RELEVANT = re.compile(
+    r"JS runtimes|JS Challenge|jsc|PO Token|SABR|Detected experiment|requires a GVS|skipped|Skipping|"
+    r"DRM|Sign in|not a bot|n-sig|nsig|player API|Downloading m3u8|unavailable", re.I)
+_DC_WORDS = ("google", "amazon", "aws", "microsoft", "azure", "digitalocean", "hetzner", "ovh", "linode",
+             "akamai", "oracle", "vultr", "contabo", "leaseweb", "cloud", "hosting", "datacenter", "server")
+
+
+class _Cap:
+    """yt-dlp-র লগ থেকে শুধু কাজের লাইনগুলো ধরে রাখে।"""
+    def __init__(self):
+        self.lines = []
+
+    def _add(self, m):
+        m = str(m).strip()
+        if m and _RELEVANT.search(m) and m not in self.lines and len(self.lines) < 40:
+            self.lines.append(m[:300])
+
+    debug = info = warning = error = _add
+
+
+def _probe_http(url, headers):
+    try:
+        h = dict(headers)
+        h["Range"] = "bytes=0-0"
+        with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=20) as r:
+            return r.status, ""
+    except urllib.error.HTTPError as e:
+        return e.code, str(e.reason)
+    except Exception as e:   # noqa
+        return None, str(e)[:100]
+
+
+def _probe_hls(url, headers):
+    from urllib.parse import urljoin
+    cur = url
+    for _ in range(3):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(cur, headers=headers), timeout=20) as r:
+                body = r.read(300000).decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            return e.code, "প্লেলিস্ট"
+        except Exception as e:   # noqa
+            return None, str(e)[:100]
+        lines = [x.strip() for x in body.splitlines() if x.strip() and not x.startswith("#")]
+        if not lines:
+            return None, "খালি প্লেলিস্ট"
+        nxt = urljoin(cur, lines[0])
+        if nxt.split("?")[0].endswith(".m3u8"):
+            cur = nxt
+            continue
+        return _probe_http(nxt, headers)
+    return None, "প্লেলিস্ট খুব গভীর"
+
+
+def diagnose(url, s):
+    """প্রতিটি পদ্ধতিতে: তথ্য আনা ✔/✖ → কোন ফরম্যাট → ডাউনলোড লিংকে প্রথম বাইট চেয়ে দেখা (HTTP স্ট্যাটাস)।
+    কিছু ডাউনলোড/কনভার্ট করে না। রিটার্ন: ডিকশনারি (env, ip, attempts, verdict, log)।"""
+    import yt_dlp
+    rep = {"env": {}, "ip": {}, "attempts": [], "verdict": "", "advice": [], "log": []}
+
+    deno = shutil.which("deno")
+    deno_v = ""
+    if deno:
+        try:
+            deno_v = subprocess.run([deno, "--version"], capture_output=True, text=True, timeout=20).stdout.splitlines()[0]
+        except Exception:
+            deno_v = "চালানো যায়নি"
+    try:
+        import yt_dlp_ejs
+        ejs = getattr(yt_dlp_ejs, "__version__", "আছে")
+    except Exception:
+        ejs = "নেই (pip install 'yt-dlp[default]')"
+    rep["env"] = {
+        "মোড": detect_mode(), "yt-dlp": ytdlp_version(),
+        f"yt-dlp ≥ {'.'.join(map(str, MIN_YTDLP))}": {True: "হ্যাঁ", False: "না - আপডেট করুন", None: "?"}[ytdlp_version_ok()],
+        "yt-dlp-ejs": ejs, "Deno": f"{deno_v} ({deno})" if deno else "নেই",
+        "FFmpeg": "আছে" if ffmpeg_ok() else "নেই", "CPU কোর": cpu_cores(),
+        "কুকি ফাইল": "আছে" if s.get("cookies") else "নেই", "ব্রাউজার-কুকি": s.get("browser") or "নেই",
+        "প্রক্সি": "আছে" if s.get("proxy") else "নেই",
+    }
+    try:
+        with urllib.request.urlopen("https://ipinfo.io/json", timeout=8) as r:
+            import json as _json
+            j = _json.loads(r.read().decode("utf-8", "replace"))
+        org = j.get("org", "")
+        rep["ip"] = {"org": org, "country": j.get("country", ""),
+                     "datacenter": any(w in org.lower() for w in _DC_WORDS)}
+    except Exception:
+        rep["ip"] = {}
+
+    seen = []
+    for strat in build_strategies(s):
+        cap = _Cap()
+        row = {"পদ্ধতি": strat["name"], "তথ্য": "", "ফরম্যাট": "", "প্রোটোকল": "", "লিংক-পরীক্ষা": "", "মন্তব্য": ""}
+        opts = strategy_opts(s, strat)
+        opts.update({"skip_download": True, "verbose": True, "logger": cap})
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            row["তথ্য"] = "✔"
+            fmt = (info.get("requested_formats") or [info])[0]
+            row["ফরম্যাট"] = f"{fmt.get('format_id')} {fmt.get('ext')}"
+            proto = str(fmt.get("protocol") or "")
+            row["প্রোটোকল"] = proto
+            furl = fmt.get("url")
+            if not furl:
+                row["লিংক-পরীক্ষা"] = "—"
+                row["মন্তব্য"] = "ফরম্যাটে URL নেই (SABR বা অনুপলব্ধ)"
+            else:
+                headers = dict(fmt.get("http_headers") or info.get("http_headers") or {})
+                code, why = _probe_hls(furl, headers) if "m3u8" in proto else _probe_http(furl, headers)
+                row["লিংক-পরীক্ষা"] = str(code) if code else "ত্রুটি"
+                row["মন্তব্য"] = "ডাউনলোড সম্ভব" if code in (200, 206) else (why or "")
+        except Exception as e:   # noqa
+            row["তথ্য"] = "✖"
+            row["মন্তব্য"] = (str(e).replace("ERROR: ", "").strip().splitlines() or ["অজানা"])[0][:160]
+        for ln in cap.lines:
+            if ln not in seen and len(seen) < 40:
+                seen.append(ln)
+        rep["attempts"].append(row)
+    rep["log"] = seen
+
+    ok_rows = [r for r in rep["attempts"] if r["লিংক-পরীক্ষা"] in ("200", "206")]
+    extr_rows = [r for r in rep["attempts"] if r["তথ্য"] == "✔"]
+    errs = " ".join(r["মন্তব্য"] for r in rep["attempts"]).lower()
+    dc = rep["ip"].get("datacenter")
+    if ok_rows:
+        rep["verdict"] = f"✔ ডাউনলোড সম্ভব। কাজ করা পদ্ধতি: {', '.join(r['পদ্ধতি'] for r in ok_rows)}"
+    elif "sign in" in errs or "not a bot" in errs:
+        rep["verdict"] = "⛔ YouTube বট-চেক দিচ্ছে (Sign in to confirm you're not a bot) - প্রধানত IP-এর কারণে"
+        rep["advice"] = ["কুকি দিন (Secrets-এ YT_COOKIES, বা লোকাল মোডে ব্রাউজার-কুকি)।",
+                         "নিজের বাসার IP থেকে (লোকাল মোডে) চালিয়ে দেখুন।"]
+    elif extr_rows:
+        rep["verdict"] = ("⛔ ফরম্যাট লিংক মিলেছে, কিন্তু সব পদ্ধতিতে ডাউনলোডে 403/ত্রুটি - "
+                          + ("এই সার্ভারের IP ডেটাসেন্টারের (ব্লক হওয়ার সম্ভাবনা বেশি)" if dc
+                             else "PO Token / SABR / IP ব্লকের লক্ষণ"))
+        rep["advice"] = [
+            "yt-dlp-কে সর্বশেষ সংস্করণে আপডেট করুন (Help → yt-dlp আপডেট → Reboot)।",
+            "কুকি দিন (Secrets-এ YT_COOKIES, বা লোকাল মোডে ব্রাউজার-কুকি; Firefox সবচেয়ে নির্ভরযোগ্য)।",
+            "একই ভিডিও নিজের কম্পিউটারে (লোকাল মোড) চালিয়ে দেখুন: সেখানে চললে সমস্যা ক্লাউড IP-এর।",
+            "ফ্রি ক্লাউডে PO Token প্রোভাইডার চালানো বাস্তবসম্মত নয়; স্থায়ী সমাধান বাসার IP বা পেইড প্রক্সি।",
+        ]
+    else:
+        rep["verdict"] = "⛔ কোনো পদ্ধতিতেই ভিডিওর তথ্য আনা যায়নি (লিংক ঠিক আছে কি? ভিডিও প্রাইভেট/ব্লকড?)"
+        rep["advice"] = ["লিংক ব্রাউজারে খুলে দেখুন; yt-dlp আপডেট করুন।"]
+    if not ytdlp_version_ok() and ytdlp_version_ok() is not None:
+        rep["advice"].insert(0, f"আপনার yt-dlp পুরনো ({ytdlp_version()}); {'.'.join(map(str, MIN_YTDLP))} বা নতুন লাগবে।")
+    if not deno:
+        rep["advice"].append("Deno (JavaScript রানটাইম) পাওয়া যায়নি - অ্যাপ রিস্টার্ট করে আবার চেষ্টা করুন।")
+    return rep
+
+
+def format_report(rep):
+    """diagnose()-এর ফলাফল সাধারণ লেখায় (টার্মিনাল / কপি করার জন্য)।"""
+    out = ["=== পরিবেশ ==="]
+    out += [f"  {k}: {v}" for k, v in rep["env"].items()]
+    if rep.get("ip"):
+        out.append(f"  সার্ভারের নেটওয়ার্ক: {rep['ip'].get('org')} ({rep['ip'].get('country')})"
+                   + ("  ← ডেটাসেন্টার" if rep["ip"].get("datacenter") else ""))
+    out += ["", "=== পদ্ধতি অনুযায়ী ফলাফল ==="]
+    for r in rep["attempts"]:
+        out.append(f"  [{r['পদ্ধতি']}] তথ্য={r['তথ্য']} ফরম্যাট={r['ফরম্যাট']} প্রোটো={r['প্রোটোকল']} "
+                   f"লিংক={r['লিংক-পরীক্ষা']} | {r['মন্তব্য']}")
+    if rep["log"]:
+        out += ["", "=== yt-dlp-র গুরুত্বপূর্ণ বার্তা ==="] + [f"  {x}" for x in rep["log"]]
+    out += ["", "=== সিদ্ধান্ত ===", "  " + rep["verdict"]]
+    out += [f"  → {a}" for a in rep["advice"]]
+    return "\n".join(out)

@@ -59,10 +59,12 @@ def secret(name, default=None):
         return default
 
 
+MODE = core.detect_mode()           # "cloud" / "server" / "local"
+IS_LOCAL = MODE == "local"
 try:
-    MAX_MINUTES = max(5, min(int(secret("MAX_MINUTES", 180)), 720))
+    MAX_MINUTES = max(5, min(int(secret("MAX_MINUTES", 720 if IS_LOCAL else 180)), 720))
 except (TypeError, ValueError):
-    MAX_MINUTES = 180
+    MAX_MINUTES = 720 if IS_LOCAL else 180
 TZ_NAME = str(secret("TIMEZONE", "Asia/Dhaka"))
 
 
@@ -146,8 +148,14 @@ def parse_urls(text):
 
 
 def friendly(err):
+    if isinstance(err, core.AllFailed):
+        return ("সবগুলো ডাউনলোড পদ্ধতি ব্যর্থ। সম্ভাব্য কারণ: YouTube-এর PO Token/SABR বা সার্ভার-IP ব্লক। "
+                "নিচের “🩺 ব্যর্থ পদ্ধতির তালিকা” ও Help ট্যাবের Diagnostics দেখুন।")
     m = str(err)
     low = m.lower()
+    if "403" in low and "forbidden" in low:
+        return ("YouTube ডাউনলোড লিংকে 403 দিয়েছে (PO Token / SABR / IP ব্লক)। "
+                "Help ট্যাবের Diagnostics চালিয়ে কারণ দেখুন।")
     if "sign in to confirm" in low or "not a bot" in low:
         return ("YouTube এই সার্ভারকে (ক্লাউড/ডেটাসেন্টার IP) ব্লক করেছে। "
                 "README-র “কুকি” অংশ দেখুন; তাতেও না হলে ফ্রি ক্লাউডে এটা চলবে না।")
@@ -160,9 +168,10 @@ def friendly(err):
     return m.replace("ERROR: ", "").strip().splitlines()[0][:220] if m.strip() else "অজানা ত্রুটি"
 
 
-def base_settings(clients_text=""):
+def base_settings(clients_text="", browser=""):
     return {
         "cookies": ENV.get("cookies"),
+        "browser": (browser or None) if IS_LOCAL else None,
         "proxy": secret("YT_PROXY", "") or None,
         "clients": [c for c in re.split(r"[,\s]+", clients_text or "") if c],
     }
@@ -200,7 +209,9 @@ st.markdown(
     chip(f"FFmpeg {'✔' if ENV['ffmpeg'] else '✖'}", ENV["ffmpeg"]) +
     chip(f"JS রানটাইম (Deno) {'✔' if ENV['deno'] else '✖'}", bool(ENV["deno"])) +
     chip(f"CPU কোর {core.cpu_cores()}") +
-    chip(f"yt-dlp {core.ytdlp_version()}") +
+    chip("মোড: লোকাল (নিজের পিসি)" if IS_LOCAL else "মোড: ক্লাউড/সার্ভার", True if IS_LOCAL else None) +
+    chip(f"yt-dlp {core.ytdlp_version()}" + ("" if core.ytdlp_version_ok() is not False else " ⚠ পুরনো - আপডেট দরকার"),
+         False if core.ytdlp_version_ok() is False else None) +
     chip(f"কুকি {'✔' if ENV['cookies'] else '— নেই'}", True if ENV["cookies"] else None) +
     chip(f"সর্বোচ্চ {MAX_MINUTES // 60}h {MAX_MINUTES % 60}m / ভিডিও"),
     unsafe_allow_html=True)
@@ -250,9 +261,18 @@ with tab_conv:
         with st.expander("উন্নত (Advanced)"):
             clients_text = st.text_input(
                 "YouTube player client (ঐচ্ছিক, কমা দিয়ে - যেমন: android_vr, web_safari)", value="",
-                help="সাধারণত খালি রাখুন। ব্লক সমস্যায় বিকল্প ক্লায়েন্ট চেষ্টা করতে চাইলে দিন।")
+                help="সাধারণত খালি রাখুন। অ্যাপ নিজেই একে একে কয়েকটি পদ্ধতি (default, android, tv, web_embedded, HLS) "
+                     "চেষ্টা করে; এখানে দিলে আপনার দেওয়াটা আগে চেষ্টা হবে।")
+            browser = ""
+            if IS_LOCAL:
+                bsel = st.selectbox(
+                    "ব্রাউজার-কুকি (শুধু লোকাল মোড)", ["— নেই —", "firefox", "edge", "chrome", "brave"],
+                    help="নিজের পিসিতে YouTube-এ লগইন করা ব্রাউজার থেকে কুকি নেয় (ফাইলে সেভ হয় না)। "
+                         "Firefox সবচেয়ে নির্ভরযোগ্য; নতুন Chrome/Edge-এ কুকি পড়া ব্যর্থ হতে পারে। "
+                         "ব্রাউজার খোলা থাকলে বন্ধ করে নিন।")
+                browser = "" if bsel.startswith("—") else bsel
 
-    base_s = base_settings(clients_text)
+    base_s = base_settings(clients_text, browser)
 
     # ---- লিংক দিলেই ভিডিওর সময় দেখানো ----
     cache = st.session_state["info_cache"]
@@ -352,6 +372,8 @@ with tab_conv:
                     break
                 except Exception as e:   # noqa
                     fail_msgs.append(f"({i + 1}/{n}) ব্যর্থ: {friendly(e)}")
+                    if isinstance(e, core.AllFailed):
+                        st.session_state["last_failure"] = {"url": u, "attempts": e.attempts}
                     continue
 
                 ok_count += 1
@@ -381,6 +403,12 @@ with tab_conv:
             ph_status.error("কোনো ফাইল তৈরি হয়নি")
         for m in fail_msgs:
             st.error(m)
+        lf = st.session_state.get("last_failure")
+        if lf and fail_msgs:
+            with st.expander("🩺 ব্যর্থ পদ্ধতির তালিকা (কোন পদ্ধতিতে কী হয়েছিল)", expanded=True):
+                st.dataframe([{"পদ্ধতি": n, "কারণ": r} for n, r in lf["attempts"]], hide_index=True)
+                st.caption("সব পদ্ধতিতে 403 মানে সাধারণত YouTube সার্ভারের IP/PO Token ব্লক করেছে। "
+                           "Help ট্যাব → Diagnostics চালিয়ে বিস্তারিত দেখুন; একই ভিডিও লোকাল মোডে চালিয়ে তুলনা করুন।")
 
     # =================================================================
     #  ফলাফল / ডাউনলোড
@@ -438,9 +466,37 @@ with tab_help:
 - ১২ ঘণ্টা কেউ না ঢুকলে অ্যাপ ঘুমিয়ে যায়; আবার ঢুকলে "Yes, get this app back up!" চাপুন।
 - তৈরি ফাইল সার্ভারে অল্প সময় থাকে, তাই কনভার্ট শেষে সঙ্গে সঙ্গে ডাউনলোড করে নিন।
 
-**YouTube "Sign in to confirm you're not a bot" দেখালে:** ক্লাউড সার্ভারের IP-কে YouTube প্রায়ই ব্লক করে।
-README-র কুকি অংশ অনুযায়ী `YT_COOKIES` সেট করুন। এটা সবসময় কাজ করার নিশ্চয়তা নেই।
+**YouTube "Sign in to confirm you're not a bot" বা "HTTP Error 403" দেখালে:** ক্লাউড সার্ভারের IP-কে YouTube প্রায়ই ব্লক করে,
+আর ২০২৬ থেকে YouTube বহু ক্লায়েন্টে PO Token/SABR বাধ্যতামূলক করেছে। অ্যাপ নিজে একে একে কয়েকটি পদ্ধতি চেষ্টা করে
+(default → android → tv → web_embedded → HLS)। সব ব্যর্থ হলে নিচের Diagnostics চালান; কুকি (`YT_COOKIES`) চেষ্টা করুন।
+এটা সবসময় কাজ করার নিশ্চয়তা নেই। **লোকাল মোড** (নিজের Windows পিসিতে `run_local_windows.bat`) বাসার IP ব্যবহার করে, তাই সেখানে সাধারণত ঠিক চলে।
 """)
+    with st.expander("🩺 Diagnostics - ডাউনলোড কেন ব্যর্থ হচ্ছে (403 / PO Token / IP)", expanded=False):
+        st.caption("কিছু ডাউনলোড বা কনভার্ট করে না; শুধু প্রতিটি পদ্ধতিতে ডাউনলোড-লিংকে প্রথম বাইট চেয়ে দেখে। "
+                   "একই ভিডিও ক্লাউডে ও নিজের পিসিতে (লোকাল মোডে) চালিয়ে ফল মিলিয়ে দেখুন।")
+        diag_url = st.text_input("পরীক্ষার ভিডিও লিংক", value=(urls[0] if urls else ""), key="diag_url")
+        if st.button("🩺 Diagnostics চালান", key="diag_btn") and diag_url.strip():
+            with st.spinner("পরীক্ষা চলছে... (১ মিনিটের মতো লাগতে পারে)"):
+                try:
+                    rep_d = core.diagnose(diag_url.strip(), base_settings("", browser if IS_LOCAL else ""))
+                except Exception as e:   # noqa
+                    rep_d = None
+                    st.error(f"Diagnostics চালানো যায়নি: {e}")
+            if rep_d:
+                (st.success if rep_d["verdict"].startswith("✔") else st.error)(rep_d["verdict"])
+                for a in rep_d["advice"]:
+                    st.write("→ " + a)
+                st.markdown("**পরিবেশ**")
+                st.dataframe([{"বিষয়": k, "মান": str(v)} for k, v in rep_d["env"].items()], hide_index=True)
+                if rep_d.get("ip"):
+                    st.write(f"সার্ভারের নেটওয়ার্ক: **{rep_d['ip'].get('org')}** ({rep_d['ip'].get('country')})"
+                             + ("  ← ডেটাসেন্টার IP" if rep_d["ip"].get("datacenter") else ""))
+                st.markdown("**পদ্ধতি অনুযায়ী ফলাফল**")
+                st.dataframe(rep_d["attempts"], hide_index=True)
+                if rep_d["log"]:
+                    st.markdown("**yt-dlp-র গুরুত্বপূর্ণ বার্তা**")
+                    st.code("\n".join(rep_d["log"]))
+                st.text_area("কপি করার জন্য পুরো রিপোর্ট", core.format_report(rep_d), height=200)
     with st.expander("🔧 রক্ষণাবেক্ষণ"):
         st.write(f"yt-dlp সংস্করণ: **{core.ytdlp_version()}**")
         if st.button("yt-dlp আপডেটের চেষ্টা করুন"):
